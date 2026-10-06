@@ -3,7 +3,7 @@
     <header class="page-head">
       <div>
         <h2>缺陷记录管理</h2>
-        <p class="page-desc">维护缺陷记录，围绕缺陷编号、所属管线、缺陷类型、发现位置做登记、筛选与状态流转。</p>
+        <p class="page-desc">维护缺陷记录，围绕缺陷编号、所属管线、缺陷类型、发现位置做登记、筛选与状态流转。巡检任务确认完成后，缺陷按来源批次一次性生成、可追溯、不重复。</p>
       </div>
       <div class="page-actions">
         <button class="btn primary" type="button" @click="openCreate">登记缺陷记录</button>
@@ -22,12 +22,24 @@
       <span v-for="item in statusSummary" :key="item.status" class="legend-item">
         {{ item.status }}：{{ item.count }}
       </span>
+      <span v-if="sourceFilter" class="legend-item">来源任务筛选：{{ sourceFilter }}</span>
     </p>
+
+    <div v-if="issues.length" class="issue-banner">
+      <strong>缺陷与巡检任务一致性检查发现 {{ issues.length }} 个问题：</strong>
+      <ul>
+        <li v-for="(issue, index) in issues" :key="`${issue.kind}-${index}`">{{ issue.message }}</li>
+      </ul>
+    </div>
 
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
         <input v-model="filters[field]" :placeholder="`按${field}检索`" />
+      </label>
+      <label class="filter-item">
+        <span>来源任务</span>
+        <input v-model="sourceFilter" placeholder="按来源任务编号检索" />
       </label>
       <button class="btn" type="submit">查询</button>
       <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
@@ -42,8 +54,18 @@
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="String(row.id)">
-          <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
+        <tr
+          v-for="row in rows"
+          :key="String(row.id)"
+          :class="{ 'issue-row': issueDefectIdSet.has(Number(row.id)) }"
+        >
+          <td v-for="column in columns" :key="column">
+            <template v-if="column === '来源任务'">
+              {{ row[column] ?? '—' }}
+              <span v-if="issueDefectIdSet.has(Number(row.id))" class="issue-tag">来源异常</span>
+            </template>
+            <template v-else>{{ row[column] ?? '—' }}</template>
+          </td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
             <button
@@ -58,40 +80,60 @@
           </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="columns.length + 2" class="empty-state">暂无缺陷记录数据，可先登记缺陷记录</td>
+          <td :colspan="columns.length + 2" class="empty-state">
+            {{ sourceFilter ? `任务「${sourceFilter}」没有对应的缺陷记录（无缺陷任务不生成占位记录）` : '暂无缺陷记录数据，完成巡检任务后自动生成' }}
+          </td>
         </tr>
       </tbody>
     </table>
 
     <footer class="page-foot">
-      <span>共 {{ total }} 条缺陷记录记录</span>
+      <span>共 {{ total }} 条缺陷记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import {
   downloadEntries,
+  inspectionConsistency,
+  issueDefectIds,
   listEntries,
   moduleMeta,
   runAction as applyAction,
 } from '@/api/local-service'
-import type { EntryRow } from '@/data/types'
+import type { ConsistencyIssue, EntryRow } from '@/data/types'
 
+const route = useRoute()
+const router = useRouter()
 const meta = moduleMeta('defect')
-const columns = ["缺陷编号", "所属管线", "缺陷类型", "发现位置", "严重等级", "发现日期", "缺陷描述", "记录状态"]
-const actions = ["确认缺陷", "标记修复", "忽略缺陷"]
-const statuses = ["待确认", "已确认", "已修复", "已忽略"]
-const stats = [{"label": "待确认缺陷", "value": 0}, {"label": "已修复缺陷", "value": 0}, {"label": "严重缺陷", "value": 0}]
+const columns = [
+  '缺陷编号',
+  '所属管线',
+  '缺陷类型',
+  '发现位置',
+  '严重等级',
+  '发现日期',
+  '缺陷描述',
+  '记录状态',
+  '来源任务',
+  '来源批次',
+]
+const actions = ['确认缺陷', '标记修复', '忽略缺陷']
+const statuses = ['待确认', '已确认', '已修复', '已忽略']
 
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
+const filterFields = ['缺陷编号', '所属管线', '缺陷类型']
+const sourceFilter = ref('')
+const issues = ref<ConsistencyIssue[]>([])
+
 const statusSummary = computed(() =>
   statuses.map((status: string) => ({
     status,
@@ -99,8 +141,27 @@ const statusSummary = computed(() =>
   })),
 )
 
+const stats = computed(() => [
+  {
+    label: '待确认缺陷',
+    value: rows.value.filter((row) => String(row.status) === '待确认').length,
+  },
+  {
+    label: '已修复缺陷',
+    value: rows.value.filter((row) => String(row.status) === '已修复').length,
+  },
+  {
+    label: '严重缺陷',
+    value: rows.value.filter((row) => String(row.严重等级) === '严重').length,
+  },
+])
+
+const issueDefectIdSet = computed(() => issueDefectIds(issues.value))
+
 function resetFilters() {
   filters.value = {}
+  sourceFilter.value = ''
+  void router.replace({ query: {} })
   reload()
 }
 
@@ -125,13 +186,31 @@ function runAction(action: string, row: EntryRow) {
 function reload() {
   errorMessage.value = ''
   try {
-    const payload = listEntries(meta.key, filters.value)
+    // 来源任务与来源批次同值（批次确定性取任务编号），用「来源任务」一个入口筛选即可。
+    const merged = sourceFilter.value.trim()
+      ? { ...filters.value, 来源任务: sourceFilter.value.trim() }
+      : filters.value
+    const payload = listEntries(meta.key, merged)
     rows.value = payload.items
     total.value = payload.total
+    issues.value = inspectionConsistency()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '缺陷记录列表读取失败'
   }
 }
 
-onMounted(reload)
+// 从巡检任务页「查看缺陷」跳进来时，按来源任务编号自动筛选。
+watch(
+  () => route.query.source,
+  (source) => {
+    sourceFilter.value = typeof source === 'string' ? source : ''
+    reload()
+  },
+)
+
+onMounted(() => {
+  const source = route.query.source
+  sourceFilter.value = typeof source === 'string' ? source : ''
+  reload()
+})
 </script>

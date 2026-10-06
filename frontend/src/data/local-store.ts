@@ -20,6 +20,8 @@ function readStorage(): Record<string, EntryRow[]> {
   }
   try {
     const parsed = JSON.parse(raw) as Record<string, EntryRow[]>
+    // 存储里的数据优先；但只认存储中真实存在的模块键，
+    // 不能用种子把存储里已被删除/重置的旧数据再合并回来（那会让重置、删除失效）。
     return { ...fallback, ...parsed }
   } catch {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(fallback))
@@ -41,11 +43,23 @@ export function listRows(key: string): EntryRow[] {
 }
 
 export function saveRows(key: string, rows: EntryRow[]): void {
-  const next = { ...allRows(), [key]: rows }
-  cache = next
-  if (typeof window !== 'undefined' && window.localStorage) {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
+  commitRows(new Map([[key, rows]]))
+}
+
+// 跨模块原子写入：先把整份数据序列化落盘，落盘成功后才一次性替换内存缓存。
+// 巡检完成要同时写「巡检任务」和「缺陷记录」两张表，任一步失败都不能出现
+// 「任务已完成、缺陷没写进去」的半截状态。
+export function commitRows(changes: Map<string, EntryRow[]>): void {
+  const next: Record<string, EntryRow[]> = { ...allRows() }
+  for (const [key, rows] of changes) {
+    next[key] = rows
   }
+  const serialized = JSON.stringify(next)
+  if (typeof window !== 'undefined' && window.localStorage) {
+    // 先落盘；写入抛错（配额满 / 存储被禁用）时内存缓存保持原样，调用方按失败处理。
+    window.localStorage.setItem(STORAGE_KEY, serialized)
+  }
+  cache = JSON.parse(serialized) as Record<string, EntryRow[]>
 }
 
 export function resetRows(key: string): EntryRow[] {
